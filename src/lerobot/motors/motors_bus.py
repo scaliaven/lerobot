@@ -24,7 +24,7 @@ from __future__ import annotations
 import abc
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -674,21 +674,24 @@ class SerialMotorsBus(MotorsBusBase):
         pass
 
     @contextmanager
-    def torque_disabled(self, motors: str | list[str] | None = None):
+    def torque_disabled(self, motors: str | list[str] | None = None, *, num_retry: int = 0) -> Iterator[None]:
         """Context-manager that guarantees torque is re-enabled.
 
         This helper is useful to temporarily disable torque when configuring motors.
+        ``num_retry`` bounds additional attempts for each torque/lock register write.
 
         Examples:
             >>> with bus.torque_disabled():
             ...     # Safe operations here
             ...     pass
         """
-        self.disable_torque(motors)
+        if num_retry < 0:
+            raise ValueError("num_retry must be nonnegative")
+        self.disable_torque(motors, num_retry=num_retry)
         try:
             yield
         finally:
-            self.enable_torque(motors)
+            self.enable_torque(motors, num_retry=num_retry)
 
     def set_timeout(self, timeout_ms: int | None = None):
         """Change the packet timeout used by the SDK.

@@ -158,7 +158,9 @@ def make_server(policy: Any, host: str = "127.0.0.1", port: int = 8080) -> HTTPS
                 return
             start = time.perf_counter()
             try:
-                action = validate_action(policy.predict(image, request["task"]))
+                action = validate_action(
+                    policy.predict(image, request["task"])
+                )  # also guards non-OpenVLA policies
             except Exception:
                 LOGGER.exception("Inference failed")
                 self.respond(500, {"error": "Inference failed; see the GPU server log"})

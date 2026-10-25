@@ -40,7 +40,7 @@ def _make_bus_mock() -> MagicMock:
     bus.disconnect.side_effect = _disconnect
 
     @contextmanager
-    def _dummy_cm():
+    def _dummy_cm(*, num_retry=0):
         yield
 
     bus.torque_disabled.side_effect = _dummy_cm
@@ -146,6 +146,7 @@ def test_configure_writes_position_pid_coefficients():
 
     SO100Follower.configure(robot)
 
+    bus_mock.torque_disabled.assert_called_once_with(num_retry=2)
     bus_mock.write.assert_any_call("P_Coefficient", "shoulder_pan", 32)
     bus_mock.write.assert_any_call("I_Coefficient", "shoulder_pan", 1)
     bus_mock.write.assert_any_call("D_Coefficient", "shoulder_pan", 16)

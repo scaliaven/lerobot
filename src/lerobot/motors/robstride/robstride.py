@@ -406,7 +406,7 @@ class RobstrideMotorsBus(MotorsBusBase):
                     time.sleep(0.01)
 
     @contextmanager
-    def torque_disabled(self, motors: str | list[str] | None = None):
+    def torque_disabled(self, motors: str | list[str] | None = None, *, num_retry: int = 0):
         """
         Context manager that guarantees torque is re-enabled.
 
@@ -417,11 +417,11 @@ class RobstrideMotorsBus(MotorsBusBase):
             ...     # Safe operations here with torque disabled
             ...     pass
         """
-        self.disable_torque(motors)
+        self.disable_torque(motors, num_retry=num_retry)
         try:
             yield
         finally:
-            self.enable_torque(motors)
+            self.enable_torque(motors, num_retry=num_retry)
 
     def set_zero_position(self, motors: str | list[str] | None = None) -> None:
         """Set current position as zero for selected motors."""

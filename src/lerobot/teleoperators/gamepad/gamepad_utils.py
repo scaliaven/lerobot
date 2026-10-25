@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from lerobot.utils.import_utils import _hidapi_available, _pygame_available, require_package
@@ -24,8 +25,14 @@ from ..utils import TeleopEvents
 
 if TYPE_CHECKING or _pygame_available:
     import pygame
+
+    try:
+        from pygame._sdl2 import controller as sdl_controller
+    except ImportError:  # Experimental module, missing from some pygame builds.
+        sdl_controller = None  # type: ignore[assignment]
 else:
     pygame = None  # type: ignore[assignment]
+    sdl_controller = None  # type: ignore[assignment]
 
 if TYPE_CHECKING or _hidapi_available:
     import hid
@@ -322,6 +329,101 @@ class GamepadController(InputController):
         except pygame.error:
             logging.error("Error reading gamepad. Is it still connected?")
             return 0.0, 0.0, 0.0
+
+
+SDL_TRIGGER_THRESHOLD = 16384
+
+
+class SDLGamepadController(InputController):
+    """Standardized SDL layout; R enables motion, ZL opens and ZR closes the gripper.
+
+    While R is held, the D-pad jogs the wrist: up/down bends it, left/right rolls it.
+    """
+
+    def __init__(self, deadzone=0.25):
+        require_package("pygame", extra="gamepad")
+        if sdl_controller is None:
+            raise ImportError("This pygame build has no pygame._sdl2; set use_sdl_controller=false")
+        super().__init__()
+        self.controller = None
+        self.deadzone = deadzone
+        self._pressed = set()
+        self.wrist_flex_command = self.wrist_roll_command = 0
+
+    def start(self):
+        # macOS delivers controller input only to the foreground app; the terminal is foreground, not Python.
+        os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+        pygame.display.init()
+        pygame.joystick.init()
+        sdl_controller.init()
+        for index in range(sdl_controller.get_count()):
+            if sdl_controller.is_controller(index):
+                self.controller = sdl_controller.Controller(index)
+                self.running = True
+                logging.info("SDL controller connected: %s", self.controller.name)
+                return
+        self.stop()
+        raise ConnectionError("No SDL-compatible gamepad detected")
+
+    def stop(self):
+        self.running = False
+        self.intervention_flag = False
+        self.wrist_flex_command = self.wrist_roll_command = 0
+        if self.controller is not None:
+            self.controller.quit()
+            self.controller = None
+        sdl_controller.quit()
+        pygame.joystick.quit()
+        pygame.display.quit()
+
+    def update(self):
+        pygame.event.pump()
+        if self.controller is None or not self.controller.attached():
+            self.intervention_flag = False
+            raise ConnectionError("Gamepad disconnected; stopping teleoperation")
+        button = self.controller.get_button
+        # SDL maps Nintendo R to RIGHTSHOULDER, independently of raw joystick button IDs.
+        self.intervention_flag = bool(button(pygame.CONTROLLER_BUTTON_RIGHTSHOULDER))
+        trigger = self.controller.get_axis
+        self.open_gripper_command = trigger(pygame.CONTROLLER_AXIS_TRIGGERLEFT) > SDL_TRIGGER_THRESHOLD
+        self.close_gripper_command = trigger(pygame.CONTROLLER_AXIS_TRIGGERRIGHT) > SDL_TRIGGER_THRESHOLD
+        # The D-pad only jogs while R is held. Negative wrist_flex tilts the gripper up on the SO-101.
+        held = self.intervention_flag
+        self.wrist_flex_command = held * (
+            int(button(pygame.CONTROLLER_BUTTON_DPAD_DOWN)) - int(button(pygame.CONTROLLER_BUTTON_DPAD_UP))
+        )
+        self.wrist_roll_command = held * (
+            int(button(pygame.CONTROLLER_BUTTON_DPAD_RIGHT)) - int(button(pygame.CONTROLLER_BUTTON_DPAD_LEFT))
+        )
+        if button(pygame.CONTROLLER_BUTTON_BACK):
+            raise KeyboardInterrupt("Controller Minus/Back pressed")
+        # Ordered by priority when several are pressed in the same cycle.
+        episode_buttons = {
+            pygame.CONTROLLER_BUTTON_Y: TeleopEvents.SUCCESS,
+            pygame.CONTROLLER_BUTTON_A: TeleopEvents.FAILURE,
+            pygame.CONTROLLER_BUTTON_B: TeleopEvents.RERECORD_EPISODE,
+        }
+        pressed = {key for key in episode_buttons if button(key)}
+        for key, event in episode_buttons.items():
+            if key in pressed - self._pressed:
+                self.episode_end_status = event
+                break
+        self._pressed = pressed
+
+    def get_deltas(self):
+        def axis(index):
+            value = self.controller.get_axis(index) / 32768.0
+            return 0.0 if abs(value) < self.deadzone else value
+
+        return (
+            -axis(pygame.CONTROLLER_AXIS_LEFTY),
+            -axis(pygame.CONTROLLER_AXIS_LEFTX),
+            -axis(pygame.CONTROLLER_AXIS_RIGHTY),
+        )
+
+    def get_wrist_deltas(self):
+        """Return (wrist_flex, wrist_roll) jog directions in {-1, 0, 1}; zero unless R is held."""
+        return self.wrist_flex_command, self.wrist_roll_command
 
 
 class GamepadControllerHID(InputController):

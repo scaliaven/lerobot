@@ -52,6 +52,9 @@ class SOFollowerConfig:
     # failure, so the steady-state read cost is unchanged.
     num_read_retries: int = 2
 
+    # Extra attempts for idempotent torque/Lock writes during startup configuration.
+    num_torque_retries: int = 2
+
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")

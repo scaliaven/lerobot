@@ -25,3 +25,9 @@ class GamepadTeleopConfig(TeleoperatorConfig):
     use_gripper: bool = True
     # Use hidapi instead of pygame for controllers that pygame cannot detect reliably.
     hidapi_fallback: bool = False
+    # Use SDL's standardized controller layout (e.g. Nintendo Switch Pro on macOS).
+    use_sdl_controller: bool = False
+
+    def __post_init__(self):
+        if self.hidapi_fallback and self.use_sdl_controller:
+            raise ValueError("Choose either hidapi_fallback or use_sdl_controller")

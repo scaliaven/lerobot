@@ -64,6 +64,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
     ForwardKinematicsJointsToEEObservation,
     GripperVelocityToJoint,
     InverseKinematicsRLStep,
+    WristJogStep,
 )
 from lerobot.teleoperators import (
     gamepad,  # noqa: F401
@@ -293,12 +294,39 @@ class RobotEnv(gym.Env):
 
     def close(self) -> None:
         """Close environment and disconnect robot."""
-        if self.robot.is_connected:
-            self.robot.disconnect()
+        release_robot(self.robot)
 
     def get_raw_joint_positions(self) -> dict[str, float]:
         """Get raw joint positions."""
         return self._raw_joint_positions
+
+
+def release_robot(robot: Robot) -> None:
+    """Disconnect a robot, releasing its bus and cameras one by one when a full disconnect is not possible.
+
+    `SOFollower.is_connected` also requires every camera, so a robot whose serial bus is open but whose
+    camera failed reports itself as disconnected and would otherwise keep its port open and torque on.
+    """
+    if robot.is_connected:
+        try:
+            robot.disconnect()
+            return
+        except Exception:
+            logging.exception("Robot disconnect failed; releasing its bus and cameras individually")
+    bus = getattr(robot, "bus", None)
+    if bus is not None and bus.is_connected:
+        try:
+            bus.disconnect(getattr(robot.config, "disable_torque_on_disconnect", True))
+        except Exception:
+            logging.exception("Disabling torque failed; closing the serial port anyway")
+            if bus.is_connected:
+                bus.disconnect(disable_torque=False)
+    for camera in getattr(robot, "cameras", {}).values():
+        if camera.is_connected:
+            try:
+                camera.disconnect()
+            except Exception:
+                logging.exception("Failed to disconnect camera %s", camera)
 
 
 def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
@@ -336,7 +364,6 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
 
     robot = make_robot_from_config(cfg.robot)
     teleop_device = make_teleoperator_from_config(cfg.teleop)
-    teleop_device.connect()
 
     # Create base environment with safe defaults
     use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
@@ -345,18 +372,37 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
 
-    env = RobotEnv(
-        robot=robot,
-        use_gripper=use_gripper,
-        display_cameras=display_cameras,
-        reset_pose=reset_pose,
-    )
+    try:
+        teleop_device.connect()
+        env = RobotEnv(
+            robot=robot,
+            use_gripper=use_gripper,
+            display_cameras=display_cameras,
+            reset_pose=reset_pose,
+        )
+    except BaseException:
+        # Startup can fail after the serial port opens and some motors have torque enabled.
+        # main() has not received an environment yet, so its finally block cannot clean up.
+        try:
+            release_robot(robot)
+        except Exception:
+            logging.exception("Failed to clean up the robot after environment startup failed")
+        try:
+            if teleop_device.is_connected:
+                teleop_device.disconnect()
+        except Exception:
+            logging.exception("Failed to clean up the teleoperator after environment startup failed")
+        raise
 
     return env, teleop_device
 
 
 def make_processors(
-    env: gym.Env, teleop_device: Teleoperator | None, cfg: HILSerlRobotEnvConfig, device: str = "cpu"
+    env: gym.Env,
+    teleop_device: Teleoperator | None,
+    cfg: HILSerlRobotEnvConfig,
+    device: str = "cpu",
+    enable_wrist_jog: bool = False,
 ) -> tuple[
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
@@ -367,6 +413,8 @@ def make_processors(
         teleop_device: Teleoperator device for intervention.
         cfg: Processor configuration.
         device: Target device for computations.
+        enable_wrist_jog: Let a controller with wrist jog input (the SDL gamepad's D-pad) drive the
+            wrist joints. The jog is not part of the teleop action, so keep it off when actions are recorded.
 
     Returns:
         Tuple of (environment processor, action processor).
@@ -494,19 +542,23 @@ def make_processors(
 
     # Replace InverseKinematicsProcessor with new kinematic processors
     if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
+        ee_reference_step = EEReferenceAndDelta(
+            kinematics=kinematics_solver,
+            end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+            motor_names=motor_names,
+            use_latched_reference=False,
+            use_ik_solution=True,
+        )
+        ik_step = InverseKinematicsRLStep(
+            kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
+        )
         # Add EE bounds and safety processor
         inverse_kinematics_steps = [
             MapTensorToDeltaActionDictStep(
                 use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
             ),
             MapDeltaActionToRobotActionStep(),
-            EEReferenceAndDelta(
-                kinematics=kinematics_solver,
-                end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-                motor_names=motor_names,
-                use_latched_reference=False,
-                use_ik_solution=True,
-            ),
+            ee_reference_step,
             EEBoundsAndSafety(
                 end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
             ),
@@ -515,10 +567,24 @@ def make_processors(
                 speed_factor=1.0,
                 discrete_gripper=True,
             ),
-            InverseKinematicsRLStep(
-                kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
-            ),
+            ik_step,
         ]
+        # Controllers that report wrist jog input (the SDL gamepad's D-pad) also drive the wrist joints.
+        gamepad_input = getattr(teleop_device, "gamepad", None)
+        if hasattr(gamepad_input, "get_wrist_deltas") and not enable_wrist_jog:
+            logging.warning("D-pad wrist jog is disabled here: recorded actions cannot represent it")
+        elif hasattr(gamepad_input, "get_wrist_deltas"):
+            inverse_kinematics_steps.append(
+                WristJogStep(
+                    kinematics=kinematics_solver,
+                    motor_names=motor_names,
+                    ee_reference_step=ee_reference_step,
+                    ik_step=ik_step,
+                    get_wrist_deltas=gamepad_input.get_wrist_deltas,
+                    end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+                    max_relative_target=getattr(cfg.robot, "max_relative_target", None),
+                )
+            )
         action_pipeline_steps.extend(inverse_kinematics_steps)
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
 
@@ -690,6 +756,7 @@ def control_loop(
     episode_idx = 0
     episode_step = 0
     episode_start_time = time.perf_counter()
+    interrupted = False
 
     try:
         while episode_idx < cfg.dataset.num_episodes_to_record:
@@ -763,14 +830,25 @@ def control_loop(
 
             # Maintain fps timing
             precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
+    except KeyboardInterrupt:
+        # Controller Minus and Ctrl-C both stop here, so episodes saved so far are still finalized below.
+        if dataset is None:
+            raise
+        interrupted = True
     finally:
         if dataset is not None and dataset.writer is not None and dataset.writer.image_writer is not None:
             logging.info("Waiting for image writer to finish...")
             dataset.writer.image_writer.stop()
 
-    if dataset is not None and cfg.dataset.push_to_hub:
-        logging.info("Finalizing dataset before pushing to hub")
-        dataset.finalize()
+    if dataset is None:
+        return
+    if interrupted:
+        # After the image writer stopped, so no queued frame lands in a deleted episode directory.
+        logging.info("Recording stopped; discarding the unfinished episode")
+        dataset.clear_episode_buffer()
+    logging.info("Finalizing dataset")
+    dataset.finalize()
+    if cfg.dataset.push_to_hub:
         logging.info("Pushing dataset to hub")
         dataset.push_to_hub()
 
@@ -806,18 +884,30 @@ def replay_trajectory(
 def main(cfg: GymManipulatorConfig) -> None:
     """Main entry point for gym manipulator script."""
     env, teleop_device = make_robot_env(cfg.env)
-    env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.device)
+    try:
+        # Wrist jog is not part of the recorded action, so allow it only for plain teleoperation.
+        env_processor, action_processor = make_processors(
+            env, teleop_device, cfg.env, cfg.device, enable_wrist_jog=cfg.mode is None
+        )
 
-    print("Environment observation space:", env.observation_space)
-    print("Environment action space:", env.action_space)
-    print("Environment processor:", env_processor)
-    print("Action processor:", action_processor)
+        print("Environment observation space:", env.observation_space)
+        print("Environment action space:", env.action_space)
+        print("Environment processor:", env_processor)
+        print("Action processor:", action_processor)
 
-    if cfg.mode == "replay":
-        replay_trajectory(env, action_processor, cfg)
-        exit()
+        if cfg.mode == "replay":
+            replay_trajectory(env, action_processor, cfg)
+            return
 
-    control_loop(env, env_processor, action_processor, teleop_device, cfg)
+        control_loop(env, env_processor, action_processor, teleop_device, cfg)
+    except KeyboardInterrupt:
+        logging.info("Teleoperation stopped")
+    finally:
+        try:
+            env.close()
+        finally:
+            if teleop_device is not None:
+                teleop_device.disconnect()
 
 
 if __name__ == "__main__":

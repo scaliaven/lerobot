@@ -60,7 +60,7 @@ class GamepadTeleop(Teleoperator):
         self.gamepad = None
 
         self.hidapi_fallback = config.hidapi_fallback
-        if sys.platform == "darwin" and not self.hidapi_fallback:
+        if sys.platform == "darwin" and not self.hidapi_fallback and not config.use_sdl_controller:
             logger.warning(
                 "On macOS, pygame may not reliably detect input from some controllers. "
                 "If you experience issues, set `hidapi_fallback=true`."
@@ -86,13 +86,17 @@ class GamepadTeleop(Teleoperator):
         return {}
 
     def connect(self) -> None:
-        if self.hidapi_fallback:
+        if self.config.use_sdl_controller:
+            from .gamepad_utils import SDLGamepadController as Gamepad
+        elif self.config.hidapi_fallback:
             from .gamepad_utils import GamepadControllerHID as Gamepad
         else:
             from .gamepad_utils import GamepadController as Gamepad
 
-        self.gamepad = Gamepad()
-        self.gamepad.start()
+        gamepad = Gamepad()
+        gamepad.start()
+        # Only now, so a failed start does not leave the teleoperator reporting itself as connected.
+        self.gamepad = gamepad
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:

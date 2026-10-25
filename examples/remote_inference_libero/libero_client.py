@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
-from remote_protocol import SUITES, RemotePolicy, validate_action
+from remote_protocol import SUITES, RemotePolicy
 
 MAX_STEPS = {
     "libero_spatial": 220,
@@ -67,16 +67,22 @@ def configure_libero(config_dir: Path) -> None:
     (destination / "config.yaml").write_text(json.dumps(paths, indent=2))
 
 
+def upright(image: np.ndarray) -> np.ndarray:
+    """LIBERO renders upside down; rotate a copy for human viewing."""
+    return image[::-1, ::-1].copy()
+
+
 class Artifacts:
     def __init__(self, directory: Path):
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "index.html").write_text(PREVIEW_HTML)
 
-    def publish(self, image: np.ndarray, status: dict) -> None:
-        # Rotate for human viewing; send the unrotated image to the model server.
-        Image.fromarray(image[::-1, ::-1].copy()).save(self.directory / "frame.tmp", format="PNG")
-        (self.directory / "frame.tmp").replace(self.directory / "latest.png")
+    def publish(self, image: np.ndarray | None, status: dict) -> None:
+        """Write the status, and the upright frame unless `image` is None (frame unchanged)."""
+        if image is not None:
+            Image.fromarray(upright(image)).save(self.directory / "frame.tmp", format="PNG")
+            (self.directory / "frame.tmp").replace(self.directory / "latest.png")
         (self.directory / "status.tmp").write_text(json.dumps(status, indent=2, allow_nan=False))
         (self.directory / "status.tmp").replace(self.directory / "latest.json")
 
@@ -124,15 +130,15 @@ def run_episode(
         for step in range(max_steps):
             image = observation["agentview_image"]
             status = {"episode": episode, "step": step, "task": task, **metadata}
-            artifacts.publish(image, {**status, "phase": "waiting for remote action"})
+            # After the first step this frame was already published as the previous step's result.
+            artifacts.publish(image if step == 0 else None, {**status, "phase": "waiting for remote action"})
             if writer is not None:
-                writer.append_data(image[::-1, ::-1].copy())
+                writer.append_data(upright(image))
             request_id = f"{run_id}:{step}"
             start = time.perf_counter()
             action, reply = policy.predict(image, task, request_id)
             round_trip_ms = (time.perf_counter() - start) * 1000
-            action = validate_action(action)
-            # Server already converts the gripper; do not invert it a second time here.
+            # RemotePolicy.predict already validated the action. Server already converts the gripper; do not invert it a second time here.
             observation, reward, done, _ = env.step(action)
             steps = step + 1
             success = bool(env.check_success())
@@ -155,7 +161,7 @@ def run_episode(
             if done or success:
                 break
         if writer is not None:
-            writer.append_data(observation["agentview_image"][::-1, ::-1].copy())
+            writer.append_data(upright(observation["agentview_image"]))
     return {"episode": episode, "steps": steps, "success": success, "task": task}
 
 

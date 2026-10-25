@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -646,3 +647,103 @@ class InverseKinematicsRLStep(ProcessorStep):
     def reset(self):
         """Resets the initial guess for the IK solver."""
         self.q_curr = None
+
+
+@ProcessorStepRegistry.register("wrist_jog_step")
+@dataclass
+class WristJogStep(ProcessorStep):
+    """
+    Jogs `wrist_flex` and `wrist_roll` directly on top of the Cartesian IK command.
+
+    Cartesian teleoperation on the 5-DOF SO-101 has no wrist inputs: the IK picks the wrist joints to
+    hold the current orientation. While a jog is active this step overrides those two joints and writes
+    the result back into the IK state, so the new wrist pose becomes the orientation the IK holds next.
+
+    Each jog starts from the measured wrist position, so a blocked or lagging wrist cannot build up a
+    target far ahead of it. A jog that would move the end effector further outside
+    `end_effector_bounds` is dropped, because this step runs after `EEBoundsAndSafety`. The check covers
+    both the IK target and the command the follower actually sends once `max_relative_target` caps each
+    joint near its measured position.
+
+    Attributes:
+        kinematics: The robot's kinematic model, used for joint limits and forward kinematics.
+        motor_names: Motor names in the order of the IK solution.
+        ee_reference_step: The pipeline's `EEReferenceAndDelta`; its held pose is moved with the wrist.
+        ik_step: The pipeline's `InverseKinematicsRLStep`; its initial guess is moved with the wrist.
+        get_wrist_deltas: Returns (wrist_flex, wrist_roll) jog directions in {-1, 0, 1}.
+        end_effector_bounds: The `EEBoundsAndSafety` workspace, a dict with "min" and "max" positions.
+        step_deg: Degrees moved per control step while a jog direction is held.
+        max_lead_deg: How far the jogged target may run ahead of the measured joint position.
+        max_relative_target: The follower's per-joint cap around the measured position, if any.
+    """
+
+    kinematics: RobotKinematics
+    motor_names: list[str]
+    ee_reference_step: EEReferenceAndDelta
+    ik_step: InverseKinematicsRLStep
+    get_wrist_deltas: Callable[[], tuple[int, int]]
+    end_effector_bounds: dict
+    step_deg: float = 2.0
+    max_lead_deg: float = 4.0
+    max_relative_target: float | dict[str, float] | None = None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        flex, roll = self.get_wrist_deltas()
+        if flex == 0 and roll == 0:
+            return transition
+
+        new_transition = dict(transition)
+        action = dict(new_transition[TransitionKey.ACTION])
+        complementary_data = dict(new_transition[TransitionKey.COMPLEMENTARY_DATA])
+        observation = new_transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError("Joints observation is require for jogging the wrist")
+        q = np.array(complementary_data["IK_solution"], dtype=float)
+        measured_q = np.array([float(observation[f"{name}.pos"]) for name in self.motor_names])
+        violation, pose = self._bounds_violation(q, measured_q)
+
+        for name, direction in (("wrist_flex", flex), ("wrist_roll", roll)):
+            if direction == 0:
+                continue
+            i = self.motor_names.index(name)
+            measured = measured_q[i]
+            base = np.clip(q[i], measured - self.max_lead_deg, measured + self.max_lead_deg)
+            low, high = np.rad2deg(self.kinematics.robot.get_joint_limits(name))
+            candidate = q.copy()
+            candidate[i] = float(np.clip(base + direction * self.step_deg, low, high))
+            candidate_violation, candidate_pose = self._bounds_violation(candidate, measured_q)
+            if np.any(candidate_violation > violation + 1e-9):
+                continue
+            q, violation, pose = candidate, candidate_violation, candidate_pose
+            action[f"{name}.pos"] = q[i]
+
+        # Keep the IK chain consistent with the jogged wrist so it does not pull the wrist back.
+        complementary_data["IK_solution"] = q
+        self.ik_step.q_curr = q.copy()
+        self.ee_reference_step._command_when_disabled = pose
+
+        new_transition[TransitionKey.ACTION] = action
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return new_transition
+
+    def _bounds_violation(self, q: np.ndarray, measured_q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return how far (m) the IK target and the capped command leave the bounds, and the target pose."""
+        commanded = q
+        if self.max_relative_target is not None:
+            if isinstance(self.max_relative_target, dict):
+                cap = np.array([self.max_relative_target.get(name, np.inf) for name in self.motor_names])
+            else:
+                cap = np.full(len(q), float(self.max_relative_target))
+            commanded = np.clip(q, measured_q - cap, measured_q + cap)
+        low = np.asarray(self.end_effector_bounds["min"], dtype=float)
+        high = np.asarray(self.end_effector_bounds["max"], dtype=float)
+        pose = self.kinematics.forward_kinematics(q)
+        violations = []
+        for pos in (pose[:3, 3], self.kinematics.forward_kinematics(commanded)[:3, 3]):
+            violations.append(np.sum(np.maximum(low - pos, 0.0) + np.maximum(pos - high, 0.0)))
+        return np.array(violations), pose
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features

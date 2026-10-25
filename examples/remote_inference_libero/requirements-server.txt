@@ -1,0 +1,14 @@
+# Isolated OpenVLA environment; do not install into LeRobot's .venv.
+# Based on https://github.com/openvla/openvla/blob/main/requirements-min.txt
+numpy==1.26.4
+setuptools>=69,<81
+torch==2.2.2
+torchvision==0.17.2
+transformers==4.40.1
+tokenizers==0.19.1
+timm==0.9.10
+accelerate==0.30.1
+bitsandbytes==0.43.3
+sentencepiece==0.1.99
+tensorflow-cpu==2.15.1
+Pillow>=10,<12

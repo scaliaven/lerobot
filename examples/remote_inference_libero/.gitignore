@@ -1,0 +1,5 @@
+.env
+.venv-openvla/
+.venv-sim/
+outputs/
+__pycache__/

@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!requirements-client.txt
+!remote_protocol.py
+!libero_client.py

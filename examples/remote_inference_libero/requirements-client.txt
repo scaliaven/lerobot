@@ -1,0 +1,13 @@
+# Separate CPU-only Linux simulation environment; no policy weights are loaded here.
+# Install torch/torchvision from the PyTorch CPU index first (see run.sh / Dockerfile).
+torch==2.2.2
+torchvision==0.17.2
+numpy==1.26.4
+setuptools>=69,<81
+hf-libero==0.1.4
+mujoco==3.2.7
+transformers==4.40.1
+opencv-python==4.10.0.84
+Pillow>=10,<12
+imageio>=2.34,<3
+imageio-ffmpeg>=0.5,<0.7
